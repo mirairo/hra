@@ -1,6 +1,6 @@
-streamlit==1.29.0
-supabase==2.3.0
-pandas==2.1.4
-openpyxl==3.1.2
-python-dotenv==1.0.0
-plotly==5.18.0
+streamlit
+supabase
+pandas
+openpyxl
+python-dotenv
+plotly
