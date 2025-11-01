@@ -4,6 +4,8 @@ from supabase import create_client, Client
 import os
 from datetime import datetime, date
 import io
+import hashlib
+import re
 
 # ========================================
 # 페이지 설정
@@ -36,6 +38,181 @@ def init_supabase():
         st.stop()
 
 supabase = init_supabase()
+
+# ========================================
+# 세션 상태 초기화
+# ========================================
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = None
+if 'user_name' not in st.session_state:
+    st.session_state.user_name = None
+if 'user_role' not in st.session_state:
+    st.session_state.user_role = None
+
+# ========================================
+# 인증 함수
+# ========================================
+def hash_password(password):
+    """비밀번호 해시화"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def validate_email(email):
+    """이메일 형식 검증"""
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+def validate_password(password):
+    """비밀번호 강도 검증 (최소 8자, 영문+숫자)"""
+    if len(password) < 8:
+        return False, "비밀번호는 최소 8자 이상이어야 합니다."
+    if not re.search(r'[A-Za-z]', password):
+        return False, "비밀번호에 영문이 포함되어야 합니다."
+    if not re.search(r'\d', password):
+        return False, "비밀번호에 숫자가 포함되어야 합니다."
+    return True, "OK"
+
+def create_users_table():
+    """사용자 테이블 생성 (최초 1회)"""
+    try:
+        # 테이블 존재 확인을 위한 쿼리
+        supabase.table('users').select("id").limit(1).execute()
+    except:
+        # 테이블이 없으면 SQL로 생성 필요
+        st.warning("⚠️ users 테이블이 없습니다. Supabase SQL Editor에서 다음을 실행하세요:")
+        st.code("""
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    role VARCHAR(50) DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_login TIMESTAMP
+);
+
+ALTER TABLE users DISABLE ROW LEVEL SECURITY;
+        """, language="sql")
+
+def register_user(email, password, name):
+    """회원가입"""
+    try:
+        # 이메일 중복 체크
+        result = supabase.table('users').select("email").eq('email', email).execute()
+        if result.data:
+            return False, "이미 등록된 이메일입니다."
+        
+        # 사용자 등록
+        password_hash = hash_password(password)
+        data = {
+            'email': email,
+            'password_hash': password_hash,
+            'name': name,
+            'role': 'user'
+        }
+        supabase.table('users').insert(data).execute()
+        return True, "회원가입이 완료되었습니다!"
+    except Exception as e:
+        return False, f"회원가입 실패: {str(e)}"
+
+def login_user(email, password):
+    """로그인"""
+    try:
+        password_hash = hash_password(password)
+        result = supabase.table('users').select("*").eq('email', email).eq('password_hash', password_hash).execute()
+        
+        if result.data and len(result.data) > 0:
+            user = result.data[0]
+            # 마지막 로그인 시간 업데이트
+            supabase.table('users').update({'last_login': datetime.now().isoformat()}).eq('email', email).execute()
+            return True, user
+        else:
+            return False, None
+    except Exception as e:
+        st.error(f"로그인 오류: {str(e)}")
+        return False, None
+
+def logout_user():
+    """로그아웃"""
+    st.session_state.logged_in = False
+    st.session_state.user_email = None
+    st.session_state.user_name = None
+    st.session_state.user_role = None
+
+# ========================================
+# 로그인/회원가입 페이지
+# ========================================
+def show_auth_page():
+    """인증 페이지"""
+    st.title("💼 기업용 인사회계 시스템")
+    st.markdown("---")
+    
+    tab1, tab2 = st.tabs(["🔐 로그인", "📝 회원가입"])
+    
+    with tab1:
+        st.subheader("로그인")
+        
+        with st.form("login_form"):
+            email = st.text_input("이메일", placeholder="example@company.com")
+            password = st.text_input("비밀번호", type="password")
+            submit = st.form_submit_button("🔓 로그인", use_container_width=True)
+            
+            if submit:
+                if not email or not password:
+                    st.error("이메일과 비밀번호를 입력하세요.")
+                elif not validate_email(email):
+                    st.error("올바른 이메일 형식이 아닙니다.")
+                else:
+                    success, user = login_user(email, password)
+                    if success:
+                        st.session_state.logged_in = True
+                        st.session_state.user_email = user['email']
+                        st.session_state.user_name = user['name']
+                        st.session_state.user_role = user['role']
+                        st.success(f"환영합니다, {user['name']}님!")
+                        st.rerun()
+                    else:
+                        st.error("이메일 또는 비밀번호가 일치하지 않습니다.")
+    
+    with tab2:
+        st.subheader("회원가입")
+        
+        with st.form("register_form"):
+            reg_name = st.text_input("이름*", placeholder="홍길동")
+            reg_email = st.text_input("이메일*", placeholder="example@company.com")
+            reg_password = st.text_input("비밀번호*", type="password", 
+                                        help="최소 8자, 영문과 숫자 포함")
+            reg_password_confirm = st.text_input("비밀번호 확인*", type="password")
+            
+            submit_reg = st.form_submit_button("✅ 회원가입", use_container_width=True)
+            
+            if submit_reg:
+                if not reg_name or not reg_email or not reg_password:
+                    st.error("모든 필수 항목을 입력하세요.")
+                elif not validate_email(reg_email):
+                    st.error("올바른 이메일 형식이 아닙니다.")
+                elif reg_password != reg_password_confirm:
+                    st.error("비밀번호가 일치하지 않습니다.")
+                else:
+                    is_valid, msg = validate_password(reg_password)
+                    if not is_valid:
+                        st.error(msg)
+                    else:
+                        success, message = register_user(reg_email, reg_password, reg_name)
+                        if success:
+                            st.success(message)
+                            st.info("로그인 탭에서 로그인하세요.")
+                        else:
+                            st.error(message)
+        
+        st.markdown("---")
+        st.info("""
+        **회원가입 안내**
+        - 이메일과 비밀번호로 간편하게 가입
+        - 비밀번호는 안전하게 암호화되어 저장
+        - 가입 후 즉시 시스템 사용 가능
+        """)
 
 # ========================================
 # 유틸리티 함수
@@ -89,26 +266,17 @@ def execute_query(table_name, operation="select", data=None, filters=None):
         st.error(f"데이터베이스 오류: {str(e)}")
         return None
 
-# ========================================
-# 엑셀 업로드 함수
-# ========================================
 def upload_excel_data(uploaded_file, table_name, column_mapping):
     """엑셀 파일을 읽어서 데이터베이스에 업로드"""
     try:
         df = pd.read_excel(uploaded_file)
-        
-        # 컬럼명 매핑
         df = df.rename(columns=column_mapping)
         
-        # 날짜 형식 변환
         for col in df.columns:
             if 'date' in col.lower():
                 df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d')
         
-        # NaN 값 처리
         df = df.fillna('')
-        
-        # 데이터베이스에 삽입
         records = df.to_dict('records')
         success_count = 0
         
@@ -124,6 +292,71 @@ def upload_excel_data(uploaded_file, table_name, column_mapping):
         return 0, 0
 
 # ========================================
+# 사용자 관리 모듈 (관리자용)
+# ========================================
+def user_management():
+    """사용자 관리 (관리자 전용)"""
+    st.header("👤 사용자 관리")
+    
+    if st.session_state.user_role != 'admin':
+        st.warning("⚠️ 관리자만 접근 가능한 메뉴입니다.")
+        return
+    
+    tab1, tab2 = st.tabs(["사용자 목록", "권한 관리"])
+    
+    with tab1:
+        st.subheader("📋 등록된 사용자")
+        
+        try:
+            users_df = pd.DataFrame(supabase.table('users').select("*").execute().data)
+            
+            if not users_df.empty:
+                display_df = users_df[['email', 'name', 'role', 'created_at', 'last_login']].copy()
+                display_df.columns = ['이메일', '이름', '권한', '가입일', '최근 로그인']
+                display_df['가입일'] = pd.to_datetime(display_df['가입일']).dt.strftime('%Y-%m-%d %H:%M')
+                display_df['최근 로그인'] = pd.to_datetime(display_df['최근 로그인']).dt.strftime('%Y-%m-%d %H:%M')
+                
+                st.dataframe(display_df, use_container_width=True, height=400)
+                st.info(f"📊 총 {len(users_df)}명의 사용자가 등록되어 있습니다.")
+            else:
+                st.warning("등록된 사용자가 없습니다.")
+        except Exception as e:
+            st.error(f"사용자 목록 조회 오류: {str(e)}")
+    
+    with tab2:
+        st.subheader("🔐 권한 관리")
+        
+        try:
+            users_df = pd.DataFrame(supabase.table('users').select("email, name, role").execute().data)
+            
+            if not users_df.empty:
+                selected_user = st.selectbox(
+                    "사용자 선택",
+                    users_df['email'].tolist(),
+                    format_func=lambda x: f"{users_df[users_df['email']==x]['name'].values[0]} ({x})"
+                )
+                
+                current_role = users_df[users_df['email']==selected_user]['role'].values[0]
+                
+                new_role = st.selectbox(
+                    "권한 설정",
+                    ['user', 'admin'],
+                    index=0 if current_role == 'user' else 1
+                )
+                
+                if st.button("💾 권한 변경"):
+                    try:
+                        supabase.table('users').update({'role': new_role}).eq('email', selected_user).execute()
+                        st.success(f"✅ {selected_user}의 권한이 {new_role}로 변경되었습니다.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"권한 변경 실패: {str(e)}")
+            else:
+                st.warning("관리할 사용자가 없습니다.")
+        except Exception as e:
+            st.error(f"권한 관리 오류: {str(e)}")
+
+# ========================================
 # 1. 직원 관리 모듈
 # ========================================
 def employee_management():
@@ -134,7 +367,6 @@ def employee_management():
     with tab1:
         st.subheader("📋 직원 목록")
         
-        # 검색 필터
         col1, col2, col3 = st.columns(3)
         with col1:
             search_name = st.text_input("이름 검색", key="emp_search_name")
@@ -143,11 +375,9 @@ def employee_management():
         with col3:
             search_status = st.selectbox("재직 상태", ["전체", "재직중", "퇴사"], key="emp_search_status")
         
-        # 데이터 조회
         df = execute_query("employees")
         
         if not df.empty:
-            # 필터 적용
             if search_name:
                 df = df[df['name'].str.contains(search_name, na=False)]
             if search_dept:
@@ -155,10 +385,8 @@ def employee_management():
             if search_status != "전체":
                 df = df[df['status'] == search_status]
             
-            # 금액 포맷팅
             df['salary_formatted'] = df['salary'].apply(format_currency)
             
-            # 표시할 컬럼 선택
             display_df = df[['employee_code', 'name', 'department', 'position', 
                             'hire_date', 'salary_formatted', 'phone', 'status']].copy()
             display_df.columns = ['사번', '이름', '부서', '직급', '입사일', '급여', '연락처', '상태']
@@ -166,7 +394,6 @@ def employee_management():
             st.dataframe(display_df, use_container_width=True, height=400)
             st.info(f"📊 총 {len(df)}명의 직원이 검색되었습니다.")
             
-            # 엑셀 다운로드
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='직원목록')
@@ -233,7 +460,6 @@ def employee_management():
         - 권장 컬럼: 부서, 직급, 입사일, 급여, 연락처, 이메일
         """)
         
-        # 샘플 템플릿 다운로드
         sample_data = {
             '사번': ['EMP001', 'EMP002'],
             '이름': ['홍길동', '김철수'],
@@ -301,7 +527,6 @@ def payroll_management():
             if search_emp:
                 df = df[df['employee_code'].str.contains(search_emp, na=False)]
             
-            # 금액 포맷팅
             for col in ['base_salary', 'bonus', 'deduction', 'net_salary']:
                 df[f'{col}_formatted'] = df[col].apply(format_currency)
             
@@ -507,7 +732,6 @@ def manage_sales():
             if search_client:
                 df = df[df['client_code'].str.contains(search_client, na=False)]
             
-            # 금액 컬럼 포맷팅
             for col in ['quantity', 'unit_price', 'amount']:
                 df[f'{col}_formatted'] = df[col].apply(format_number)
             
@@ -518,7 +742,6 @@ def manage_sales():
             
             st.dataframe(display_df, use_container_width=True, height=400)
             
-            # 합계 표시
             total_amount = df['amount'].sum()
             st.metric("💰 총 매출액", format_currency(total_amount))
         else:
@@ -590,7 +813,6 @@ def manage_purchases():
             if search_supplier:
                 df = df[df['supplier_code'].str.contains(search_supplier, na=False)]
             
-            # 금액 컬럼 포맷팅
             for col in ['quantity', 'unit_price', 'amount']:
                 df[f'{col}_formatted'] = df[col].apply(format_number)
             
@@ -601,7 +823,6 @@ def manage_purchases():
             
             st.dataframe(display_df, use_container_width=True, height=400)
             
-            # 합계 표시
             total_amount = df['amount'].sum()
             st.metric("💰 총 매입액", format_currency(total_amount))
         else:
@@ -678,7 +899,6 @@ def trade_management():
             if search_type != "전체":
                 df = df[df['transaction_type'] == search_type]
             
-            # 금액 컬럼 포맷팅
             for col in ['quantity', 'unit_price', 'amount', 'exchange_rate', 'krw_amount']:
                 if col in df.columns:
                     df[f'{col}_formatted'] = df[col].apply(format_number)
@@ -692,7 +912,6 @@ def trade_management():
             
             st.dataframe(display_df, use_container_width=True, height=400)
             
-            # 통계 표시
             col_s1, col_s2, col_s3 = st.columns(3)
             with col_s1:
                 total_export = df[df['transaction_type'] == '수출']['krw_amount'].sum()
@@ -768,7 +987,6 @@ def trade_management():
 def dashboard():
     st.header("📊 대시보드")
     
-    # 주요 지표 표시
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -793,7 +1011,6 @@ def dashboard():
     
     st.divider()
     
-    # 차트 표시
     col_chart1, col_chart2 = st.columns(2)
     
     with col_chart1:
@@ -818,7 +1035,6 @@ def dashboard():
     
     st.divider()
     
-    # 최근 거래 내역
     st.subheader("📋 최근 거래 내역")
     
     tab1, tab2, tab3 = st.tabs(["최근 매출", "최근 매입", "최근 무역거래"])
@@ -859,23 +1075,44 @@ def dashboard():
 # 메인 애플리케이션
 # ========================================
 def main():
+    # 로그인 확인
+    if not st.session_state.logged_in:
+        show_auth_page()
+        return
+    
     # 사이드바 메뉴
     st.sidebar.title("💼 인사회계 시스템")
+    st.sidebar.markdown(f"**환영합니다, {st.session_state.user_name}님!**")
+    st.sidebar.markdown(f"권한: {st.session_state.user_role}")
     st.sidebar.markdown("---")
+    
+    # 메뉴 구성
+    menu_items = ["🏠 대시보드", "👥 직원 관리", "💰 급여 관리", "🏢 거래처 관리", 
+                  "📊 매출/매입 관리", "🌏 무역 관리"]
+    
+    # 관리자 메뉴 추가
+    if st.session_state.user_role == 'admin':
+        menu_items.append("👤 사용자 관리")
     
     menu = st.sidebar.radio(
         "메뉴 선택",
-        ["🏠 대시보드", "👥 직원 관리", "💰 급여 관리", "🏢 거래처 관리", 
-         "📊 매출/매입 관리", "🌏 무역 관리"],
+        menu_items,
         label_visibility="collapsed"
     )
     
     st.sidebar.markdown("---")
-    st.sidebar.info("""
+    
+    # 로그아웃 버튼
+    if st.sidebar.button("🚪 로그아웃", use_container_width=True):
+        logout_user()
+        st.rerun()
+    
+    st.sidebar.markdown("---")
+    st.sidebar.info(f"""
     **시스템 정보**
-    - 버전: 1.0.0
+    - 사용자: {st.session_state.user_email}
+    - 버전: 2.0.0
     - 데이터베이스: Supabase
-    - 개발: Python + Streamlit
     """)
     
     # 페이지 라우팅
@@ -891,6 +1128,8 @@ def main():
         sales_purchase_management()
     elif menu == "🌏 무역 관리":
         trade_management()
+    elif menu == "👤 사용자 관리":
+        user_management()
 
 if __name__ == "__main__":
     main()
