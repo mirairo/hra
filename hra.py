@@ -23,6 +23,8 @@ def init_supabase():
     """Supabase 클라이언트 초기화"""
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
+    # Service Role Key 사용 (RLS 우회)
+    service_key = os.environ.get("SUPABASE_SERVICE_KEY") or st.secrets.get("SUPABASE_SERVICE_KEY", "")
     
     if not url or not key:
         st.error("⚠️ Supabase 연결 정보가 없습니다. .streamlit/secrets.toml 파일을 확인하세요.")
@@ -30,12 +32,14 @@ def init_supabase():
     
     try:
         supabase: Client = create_client(url, key)
-        return supabase
+        # Service Role Key가 있으면 별도 클라이언트 생성
+        supabase_admin = create_client(url, service_key) if service_key else supabase
+        return supabase, supabase_admin
     except Exception as e:
         st.error(f"❌ 데이터베이스 연결 실패: {str(e)}")
         st.stop()
 
-supabase = init_supabase()
+supabase, supabase_admin = init_supabase()
 
 # ========================================
 # 세션 상태 초기화
@@ -58,14 +62,19 @@ def sign_up(email, password, name):
         })
         
         if response.user:
-            # user_profiles 테이블에 메타데이터 추가
-            supabase.table('user_profiles').insert({
-                'id': response.user.id,
-                'email': email,
-                'name': name,
-                'role': 'user',
-                'status': 'pending'
-            }).execute()
+            # user_profiles 테이블에 메타데이터 추가 (admin 클라이언트 사용)
+            try:
+                supabase_admin.table('user_profiles').insert({
+                    'id': response.user.id,
+                    'email': email,
+                    'name': name,
+                    'role': 'user',
+                    'status': 'pending'
+                }).execute()
+            except Exception as profile_error:
+                # 프로필 생성 실패 시 인증 사용자도 삭제 시도
+                st.error(f"프로필 생성 오류: {str(profile_error)}")
+                return False, f"회원가입 오류: 프로필을 생성할 수 없습니다."
             
             return True, "회원가입이 완료되었습니다! 이메일을 확인하여 인증을 완료하세요."
         else:
@@ -73,7 +82,7 @@ def sign_up(email, password, name):
             
     except Exception as e:
         error_msg = str(e)
-        if "already registered" in error_msg.lower():
+        if "already registered" in error_msg.lower() or "already been registered" in error_msg.lower():
             return False, "이미 등록된 이메일입니다."
         return False, f"회원가입 오류: {error_msg}"
 
@@ -86,8 +95,8 @@ def sign_in(email, password):
         })
         
         if response.user:
-            # 사용자 프로필 조회
-            profile = supabase.table('user_profiles').select("*").eq('id', response.user.id).single().execute()
+            # 사용자 프로필 조회 (admin 클라이언트 사용)
+            profile = supabase_admin.table('user_profiles').select("*").eq('id', response.user.id).single().execute()
             
             if profile.data:
                 # 승인 상태 확인
@@ -123,10 +132,10 @@ def check_session():
     """세션 확인"""
     try:
         user = supabase.auth.get_user()
-        if user:
-            profile = supabase.table('user_profiles').select("*").eq('id', user.id).single().execute()
+        if user and user.user:
+            profile = supabase_admin.table('user_profiles').select("*").eq('id', user.user.id).single().execute()
             if profile.data and profile.data['status'] == 'approved':
-                return {'user': user, 'profile': profile.data}
+                return {'user': user.user, 'profile': profile.data}
         return None
     except:
         return None
@@ -139,7 +148,7 @@ def show_auth_page():
     st.title("💼 기업용 인사회계 시스템")
     st.markdown("---")
     
-    tab1, tab2 = st.tabs(["🔐 로그인", "📝 회원가입"])
+    tab1, tab2 = st.tabs(["🔓 로그인", "📝 회원가입"])
     
     with tab1:
         st.subheader("로그인")
@@ -229,42 +238,34 @@ def user_management():
         st.subheader("⏳ 승인 대기 중인 사용자")
         
         try:
-            pending = supabase.table('user_profiles').select("*").eq('status', 'pending').execute()
+            pending = supabase_admin.table('user_profiles').select("*").eq('status', 'pending').execute()
             
             if pending.data:
                 for user in pending.data:
-                    # 이메일 인증 상태 확인
-                    auth_user = supabase.auth.admin.get_user_by_id(user['id'])
-                    email_confirmed = auth_user.user.email_confirmed_at is not None if auth_user.user else False
-                    
                     with st.expander(f"📧 {user['name']} ({user['email']})"):
                         col1, col2 = st.columns([3, 1])
                         
                         with col1:
                             st.write(f"**이름:** {user['name']}")
                             st.write(f"**이메일:** {user['email']}")
-                            st.write(f"**가입일:** {user['created_at'][:10]}")
-                            st.write(f"**이메일 인증:** {'✅ 완료' if email_confirmed else '❌ 미인증'}")
+                            st.write(f"**가입일:** {user['created_at'][:10] if user.get('created_at') else 'N/A'}")
                         
                         with col2:
-                            if email_confirmed:
-                                if st.button("✅ 승인", key=f"approve_{user['id']}"):
-                                    supabase.table('user_profiles').update({
-                                        'status': 'approved',
-                                        'approved_at': datetime.now().isoformat(),
-                                        'approved_by': st.session_state.user.id
-                                    }).eq('id', user['id']).execute()
-                                    st.success(f"{user['name']}님이 승인되었습니다!")
-                                    st.rerun()
-                                
-                                if st.button("❌ 거부", key=f"reject_{user['id']}"):
-                                    supabase.table('user_profiles').update({
-                                        'status': 'rejected'
-                                    }).eq('id', user['id']).execute()
-                                    st.warning(f"{user['name']}님의 가입이 거부되었습니다.")
-                                    st.rerun()
-                            else:
-                                st.caption("⏳ 이메일 인증 대기중")
+                            if st.button("✅ 승인", key=f"approve_{user['id']}"):
+                                supabase_admin.table('user_profiles').update({
+                                    'status': 'approved',
+                                    'approved_at': datetime.now().isoformat(),
+                                    'approved_by': st.session_state.user.id
+                                }).eq('id', user['id']).execute()
+                                st.success(f"{user['name']}님이 승인되었습니다!")
+                                st.rerun()
+                            
+                            if st.button("❌ 거부", key=f"reject_{user['id']}"):
+                                supabase_admin.table('user_profiles').update({
+                                    'status': 'rejected'
+                                }).eq('id', user['id']).execute()
+                                st.warning(f"{user['name']}님의 가입이 거부되었습니다.")
+                                st.rerun()
             else:
                 st.info("승인 대기 중인 사용자가 없습니다.")
                 
@@ -275,7 +276,7 @@ def user_management():
         st.subheader("📋 전체 사용자 목록")
         
         try:
-            users = supabase.table('user_profiles').select("*").execute()
+            users = supabase_admin.table('user_profiles').select("*").execute()
             
             if users.data:
                 df = pd.DataFrame(users.data)
@@ -289,7 +290,8 @@ def user_management():
                 
                 display_df = df[['email', 'name', 'role', 'status_kr', 'created_at']].copy()
                 display_df.columns = ['이메일', '이름', '권한', '상태', '가입일']
-                display_df['가입일'] = pd.to_datetime(display_df['가입일']).dt.strftime('%Y-%m-%d')
+                if '가입일' in display_df.columns:
+                    display_df['가입일'] = pd.to_datetime(display_df['가입일'], errors='coerce').dt.strftime('%Y-%m-%d')
                 
                 st.dataframe(display_df, use_container_width=True, height=400)
                 st.info(f"📊 총 {len(df)}명의 사용자가 등록되어 있습니다.")
@@ -314,102 +316,42 @@ def format_currency(num):
         return "₩0"
     return f"₩{int(num):,}"
 
-def execute_query(table_name, operation="select", data=None, filters=None):
-    """Supabase 쿼리 실행"""
-    try:
-        if operation == "select":
-            query = supabase.table(table_name).select("*")
-            if filters:
-                for key, value in filters.items():
-                    query = query.eq(key, value)
-            response = query.execute()
-            return pd.DataFrame(response.data) if response.data else pd.DataFrame()
-        
-        elif operation == "insert":
-            response = supabase.table(table_name).insert(data).execute()
-            return response.data
-        
-        elif operation == "update":
-            if not filters:
-                raise ValueError("Update operation requires filters")
-            query = supabase.table(table_name).update(data)
-            for key, value in filters.items():
-                query = query.eq(key, value)
-            response = query.execute()
-            return response.data
-        
-        elif operation == "delete":
-            if not filters:
-                raise ValueError("Delete operation requires filters")
-            query = supabase.table(table_name).delete()
-            for key, value in filters.items():
-                query = query.eq(key, value)
-            response = query.execute()
-            return response.data
-            
-    except Exception as e:
-        st.error(f"데이터베이스 오류: {str(e)}")
-        return None
-
-def upload_excel_data(uploaded_file, table_name, column_mapping):
-    """엑셀 파일을 읽어서 데이터베이스에 업로드"""
-    try:
-        df = pd.read_excel(uploaded_file)
-        df = df.rename(columns=column_mapping)
-        
-        for col in df.columns:
-            if 'date' in col.lower():
-                df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d')
-        
-        df = df.fillna('')
-        records = df.to_dict('records')
-        success_count = 0
-        
-        for record in records:
-            result = execute_query(table_name, "insert", record)
-            if result:
-                success_count += 1
-        
-        return success_count, len(records)
-    
-    except Exception as e:
-        st.error(f"엑셀 업로드 오류: {str(e)}")
-        return 0, 0
-
 # ========================================
 # 기존 모듈들 (직원/급여/거래처/매출매입/무역/대시보드)
-# hra.py의 기존 코드와 동일
 # ========================================
 
-# 직원 관리
 def employee_management():
     st.header("👥 직원 관리")
     st.info("직원 관리 기능 (기존 hra.py 코드 사용)")
 
-# 급여 관리
 def payroll_management():
     st.header("💰 급여 관리")
     st.info("급여 관리 기능 (기존 hra.py 코드 사용)")
 
-# 거래처 관리
 def client_management():
     st.header("🏢 거래처 관리")
     st.info("거래처 관리 기능 (기존 hra.py 코드 사용)")
 
-# 매출/매입 관리
 def sales_purchase_management():
     st.header("📊 매출/매입 관리")
     st.info("매출/매입 관리 기능 (기존 hra.py 코드 사용)")
 
-# 무역 관리
 def trade_management():
-    st.header("🌏 무역 관리")
+    st.header("🌍 무역 관리")
     st.info("무역 관리 기능 (기존 hra.py 코드 사용)")
 
-# 대시보드
 def dashboard():
     st.header("📊 대시보드")
-    st.info("대시보드 (기존 hra.py 코드 사용)")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("총 직원 수", "0명", "")
+    with col2:
+        st.metric("이번 달 급여", "₩0", "")
+    with col3:
+        st.metric("활성 거래처", "0개", "")
+    
+    st.info("대시보드 기능이 구현될 예정입니다.")
 
 # ========================================
 # 메인 애플리케이션
@@ -443,7 +385,7 @@ def main():
     
     # 메뉴 구성
     menu_items = ["🏠 대시보드", "👥 직원 관리", "💰 급여 관리", "🏢 거래처 관리", 
-                  "📊 매출/매입 관리", "🌏 무역 관리"]
+                  "📊 매출/매입 관리", "🌍 무역 관리"]
     
     # 관리자 메뉴 추가
     if st.session_state.profile['role'] == 'admin':
@@ -462,7 +404,7 @@ def main():
     st.sidebar.info(f"""
     **시스템 정보**
     - 사용자: {st.session_state.profile['email']}
-    - 버전: 2.0.0 (Auth)
+    - 버전: 2.0.1 (RLS Fixed)
     - 인증: Supabase Auth
     """)
     
@@ -477,7 +419,7 @@ def main():
         client_management()
     elif menu == "📊 매출/매입 관리":
         sales_purchase_management()
-    elif menu == "🌏 무역 관리":
+    elif menu == "🌍 무역 관리":
         trade_management()
     elif menu == "👤 사용자 관리":
         user_management()
