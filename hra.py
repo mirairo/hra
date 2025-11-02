@@ -23,8 +23,6 @@ def init_supabase():
     """Supabase 클라이언트 초기화"""
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
-    # Service Role Key 사용 (RLS 우회)
-    service_key = os.environ.get("SUPABASE_SERVICE_KEY") or st.secrets.get("SUPABASE_SERVICE_KEY", "")
     
     if not url or not key:
         st.error("⚠️ Supabase 연결 정보가 없습니다. .streamlit/secrets.toml 파일을 확인하세요.")
@@ -32,14 +30,12 @@ def init_supabase():
     
     try:
         supabase: Client = create_client(url, key)
-        # Service Role Key가 있으면 별도 클라이언트 생성
-        supabase_admin = create_client(url, service_key) if service_key else supabase
-        return supabase, supabase_admin
+        return supabase
     except Exception as e:
         st.error(f"❌ 데이터베이스 연결 실패: {str(e)}")
         st.stop()
 
-supabase, supabase_admin = init_supabase()
+supabase = init_supabase()
 
 # ========================================
 # 세션 상태 초기화
@@ -48,6 +44,71 @@ if 'user' not in st.session_state:
     st.session_state.user = None
 if 'profile' not in st.session_state:
     st.session_state.profile = None
+
+# ========================================
+# RLS 정책 비활성화 안내
+# ========================================
+def show_rls_warning():
+    """RLS 정책 수정 안내"""
+    st.error("""
+    ### ⚠️ Supabase RLS 정책 오류 감지
+    
+    `user_profiles` 테이블의 RLS 정책에서 무한 재귀가 발생하고 있습니다.
+    
+    **해결 방법:**
+    
+    1. Supabase Dashboard 접속
+    2. Table Editor → user_profiles 테이블 선택
+    3. RLS (Row Level Security) 탭으로 이동
+    4. 모든 정책 삭제 또는 아래 정책으로 교체
+    
+    **추천 정책 (SQL Editor에서 실행):**
+    
+    ```sql
+    -- 기존 정책 모두 삭제
+    DROP POLICY IF EXISTS "Users can view own profile" ON user_profiles;
+    DROP POLICY IF EXISTS "Users can update own profile" ON user_profiles;
+    DROP POLICY IF EXISTS "Enable insert for authenticated users" ON user_profiles;
+    
+    -- RLS 활성화
+    ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
+    
+    -- 새 정책 생성 (무한 재귀 방지)
+    CREATE POLICY "Allow authenticated insert"
+    ON user_profiles FOR INSERT
+    TO authenticated
+    WITH CHECK (auth.uid() = id);
+    
+    CREATE POLICY "Allow users to read own profile"
+    ON user_profiles FOR SELECT
+    TO authenticated
+    USING (auth.uid() = id);
+    
+    CREATE POLICY "Allow users to update own profile"
+    ON user_profiles FOR UPDATE
+    TO authenticated
+    USING (auth.uid() = id);
+    
+    -- 관리자는 모든 프로필 조회 가능
+    CREATE POLICY "Allow admins to read all profiles"
+    ON user_profiles FOR SELECT
+    TO authenticated
+    USING (
+        EXISTS (
+            SELECT 1 FROM user_profiles
+            WHERE id = auth.uid() AND role = 'admin'
+        )
+    );
+    ```
+    
+    **또는 임시로 RLS 비활성화 (개발 중에만):**
+    
+    ```sql
+    ALTER TABLE user_profiles DISABLE ROW LEVEL SECURITY;
+    ```
+    
+    설정 후 페이지를 새로고침하세요.
+    """)
 
 # ========================================
 # 인증 함수
@@ -62,9 +123,9 @@ def sign_up(email, password, name):
         })
         
         if response.user:
-            # user_profiles 테이블에 메타데이터 추가 (admin 클라이언트 사용)
+            # user_profiles 테이블에 메타데이터 추가
             try:
-                supabase_admin.table('user_profiles').insert({
+                supabase.table('user_profiles').insert({
                     'id': response.user.id,
                     'email': email,
                     'name': name,
@@ -72,9 +133,14 @@ def sign_up(email, password, name):
                     'status': 'pending'
                 }).execute()
             except Exception as profile_error:
-                # 프로필 생성 실패 시 인증 사용자도 삭제 시도
-                st.error(f"프로필 생성 오류: {str(profile_error)}")
-                return False, f"회원가입 오류: 프로필을 생성할 수 없습니다."
+                error_msg = str(profile_error)
+                # RLS 정책 오류 감지
+                if 'infinite recursion' in error_msg or '42P17' in error_msg:
+                    show_rls_warning()
+                    return False, "RLS 정책 오류가 감지되었습니다. 위의 안내를 참고하여 수정해주세요."
+                else:
+                    st.error(f"프로필 생성 오류: {error_msg}")
+                    return False, f"회원가입 오류: 프로필을 생성할 수 없습니다."
             
             return True, "회원가입이 완료되었습니다! 이메일을 확인하여 인증을 완료하세요."
         else:
@@ -95,19 +161,26 @@ def sign_in(email, password):
         })
         
         if response.user:
-            # 사용자 프로필 조회 (admin 클라이언트 사용)
-            profile = supabase_admin.table('user_profiles').select("*").eq('id', response.user.id).single().execute()
-            
-            if profile.data:
-                # 승인 상태 확인
-                if profile.data['status'] != 'approved':
-                    supabase.auth.sign_out()
-                    return False, None, "관리자 승인 대기중입니다. 승인 후 로그인할 수 있습니다."
+            # 사용자 프로필 조회
+            try:
+                profile = supabase.table('user_profiles').select("*").eq('id', response.user.id).single().execute()
                 
-                return True, {'user': response.user, 'profile': profile.data}, None
-            else:
-                supabase.auth.sign_out()
-                return False, None, "사용자 프로필을 찾을 수 없습니다."
+                if profile.data:
+                    # 승인 상태 확인
+                    if profile.data['status'] != 'approved':
+                        supabase.auth.sign_out()
+                        return False, None, "관리자 승인 대기중입니다. 승인 후 로그인할 수 있습니다."
+                    
+                    return True, {'user': response.user, 'profile': profile.data}, None
+                else:
+                    supabase.auth.sign_out()
+                    return False, None, "사용자 프로필을 찾을 수 없습니다."
+            except Exception as profile_error:
+                error_msg = str(profile_error)
+                if 'infinite recursion' in error_msg or '42P17' in error_msg:
+                    show_rls_warning()
+                    return False, None, "RLS 정책 오류가 감지되었습니다."
+                raise
         
         return False, None, "로그인 실패"
         
@@ -133,11 +206,14 @@ def check_session():
     try:
         user = supabase.auth.get_user()
         if user and user.user:
-            profile = supabase_admin.table('user_profiles').select("*").eq('id', user.user.id).single().execute()
+            profile = supabase.table('user_profiles').select("*").eq('id', user.user.id).single().execute()
             if profile.data and profile.data['status'] == 'approved':
                 return {'user': user.user, 'profile': profile.data}
         return None
-    except:
+    except Exception as e:
+        error_msg = str(e)
+        if 'infinite recursion' in error_msg or '42P17' in error_msg:
+            show_rls_warning()
         return None
 
 # ========================================
@@ -170,7 +246,8 @@ def show_auth_page():
                             st.success(f"환영합니다, {data['profile']['name']}님!")
                             st.rerun()
                         else:
-                            st.error(error)
+                            if error:
+                                st.error(error)
         
         st.markdown("---")
         st.info("""
@@ -238,7 +315,7 @@ def user_management():
         st.subheader("⏳ 승인 대기 중인 사용자")
         
         try:
-            pending = supabase_admin.table('user_profiles').select("*").eq('status', 'pending').execute()
+            pending = supabase.table('user_profiles').select("*").eq('status', 'pending').execute()
             
             if pending.data:
                 for user in pending.data:
@@ -252,7 +329,7 @@ def user_management():
                         
                         with col2:
                             if st.button("✅ 승인", key=f"approve_{user['id']}"):
-                                supabase_admin.table('user_profiles').update({
+                                supabase.table('user_profiles').update({
                                     'status': 'approved',
                                     'approved_at': datetime.now().isoformat(),
                                     'approved_by': st.session_state.user.id
@@ -261,7 +338,7 @@ def user_management():
                                 st.rerun()
                             
                             if st.button("❌ 거부", key=f"reject_{user['id']}"):
-                                supabase_admin.table('user_profiles').update({
+                                supabase.table('user_profiles').update({
                                     'status': 'rejected'
                                 }).eq('id', user['id']).execute()
                                 st.warning(f"{user['name']}님의 가입이 거부되었습니다.")
@@ -270,13 +347,17 @@ def user_management():
                 st.info("승인 대기 중인 사용자가 없습니다.")
                 
         except Exception as e:
-            st.error(f"데이터 조회 오류: {str(e)}")
+            error_msg = str(e)
+            if 'infinite recursion' in error_msg or '42P17' in error_msg:
+                show_rls_warning()
+            else:
+                st.error(f"데이터 조회 오류: {error_msg}")
     
     with tab2:
         st.subheader("📋 전체 사용자 목록")
         
         try:
-            users = supabase_admin.table('user_profiles').select("*").execute()
+            users = supabase.table('user_profiles').select("*").execute()
             
             if users.data:
                 df = pd.DataFrame(users.data)
@@ -299,7 +380,11 @@ def user_management():
                 st.warning("등록된 사용자가 없습니다.")
                 
         except Exception as e:
-            st.error(f"사용자 목록 조회 오류: {str(e)}")
+            error_msg = str(e)
+            if 'infinite recursion' in error_msg or '42P17' in error_msg:
+                show_rls_warning()
+            else:
+                st.error(f"사용자 목록 조회 오류: {error_msg}")
 
 # ========================================
 # 유틸리티 함수
@@ -404,7 +489,7 @@ def main():
     st.sidebar.info(f"""
     **시스템 정보**
     - 사용자: {st.session_state.profile['email']}
-    - 버전: 2.0.1 (RLS Fixed)
+    - 버전: 2.0.2 (RLS Warning)
     - 인증: Supabase Auth
     """)
     
